@@ -929,7 +929,49 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
     except Exception as e:
         return _error(e)
 
+class AddToCollectionInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int = Field(..., description="The Shopify product ID")
+    collection_id: int = Field(..., description="The Shopify collection ID")
 
+@mcp.tool(
+    name="shopify_add_to_collection",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_add_to_collection(params: AddToCollectionInput) -> str:
+    """Add a product to a manual collection via the Collects API."""
+    try:
+        data = await _request("POST", "collects.json", body={
+            "collect": {
+                "product_id": params.product_id,
+                "collection_id": params.collection_id,
+            }
+        })
+        return _fmt(data.get("collect", data))
+    except Exception as e:
+        return _error(e)
+
+
+class AddProductImageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int = Field(..., description="The Shopify product ID")
+    src: str = Field(..., description="Public URL of the image to add")
+    alt: Optional[str] = Field(default=None, description="Alt text for the image")
+
+@mcp.tool(
+    name="shopify_add_product_image",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_add_product_image(params: AddProductImageInput) -> str:
+    """Add an image to an existing product by URL."""
+    try:
+        image: Dict[str, Any] = {"src": params.src}
+        if params.alt:
+            image["alt"] = params.alt
+        data = await _request("POST", f"products/{params.product_id}/images.json", body={"image": image})
+        return _fmt(data.get("image", data))
+    except Exception as e:
+        return _error(e)
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
