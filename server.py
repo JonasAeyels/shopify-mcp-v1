@@ -232,6 +232,9 @@ def _error(e: Exception) -> str:
             detail = e.response.json()
         except Exception:
             detail = e.response.text[:500]
+        host = e.request.url.host
+        if not host.endswith("myshopify.com"):
+            return f"{host} error {status} on {e.request.url.path}: {json.dumps(detail)[:300]}"
         messages = {
             401: "Authentication failed — check your SHOPIFY_ACCESS_TOKEN (should start with shpat_).",
             403: "Permission denied — your token may be missing required API scopes.",
@@ -1023,7 +1026,7 @@ class CJClient:
 
     async def get(self, path: str, params: Optional[dict] = None) -> Any:
         token = await self._get_token()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(
                 f"{CJ_BASE_URL}/{path}",
                 headers={"CJ-Access-Token": token},
@@ -1097,9 +1100,9 @@ async def _usd_rate(currency: str, day: str) -> float:
         return 1.0
     if USD_TO_SHOP_RATE:
         return float(USD_TO_SHOP_RATE)
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(
-            f"https://api.frankfurter.app/{day}",
+            f"https://api.frankfurter.dev/v1/{day}",
             params={"from": "USD", "to": currency},
             timeout=15.0,
         )
