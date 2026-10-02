@@ -1092,7 +1092,30 @@ async def _cj_costs_for(order_keys: set, oldest_date: str) -> Dict[str, dict]:
         last_created = str(rows[-1].get("createDate") or "")[:10]
         if last_created and last_created < oldest_date:
             break
+
+    # The list endpoint does not always carry amounts; fill them from the order detail.
+    for k, row in found.items():
+        if _cj_row_cost(row) or not row.get("orderId"):
+            continue
+        try:
+            detail = await cj_client.get("shopping/order/getOrderDetail", {"orderId": row["orderId"]})
+            if isinstance(detail, dict):
+                found[k] = {**row, **{f: v for f, v in detail.items() if v not in (None, "")}}
+        except Exception as e:
+            logger.warning(f"CJ order detail failed for {row.get('orderId')}: {e}")
     return found
+
+
+def _cj_row_cost(row: dict) -> float:
+    return _to_float(row.get("orderAmount")) or (
+        _to_float(row.get("productAmount")) + _to_float(row.get("postageAmount"))
+    )
+
+
+def _cj_amount_fields(row: dict) -> dict:
+    """Amount/status fields of a CJ order, for diagnosing cost matching."""
+    words = ("amount", "price", "postage", "cost", "fee", "status")
+    return {k: v for k, v in row.items() if any(w in k.lower() for w in words) and not isinstance(v, (dict, list))}
 
 
 async def _usd_rate(currency: str, day: str) -> float:
@@ -1113,7 +1136,7 @@ async def _usd_rate(currency: str, day: str) -> float:
 async def _google_ads_spend(day: str) -> Optional[float]:
     """Read spend for `day` from a published Google Sheet CSV (columns: date,cost)."""
     if not GOOGLE_ADS_SPEND_CSV_URL:
-        return None
+        raise LookupError("GOOGLE_ADS_SPEND_CSV_URL is not set — pass ad_spend or add the variable in Railway.")
     async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(GOOGLE_ADS_SPEND_CSV_URL, timeout=30.0)
     resp.raise_for_status()
@@ -1123,7 +1146,12 @@ async def _google_ads_spend(day: str) -> Optional[float]:
         if len(cells) >= 2 and cells[0].strip()[:10] == day:
             total += _to_float(cells[1].strip().replace(",", "."))
             seen = True
-    return total if seen else None
+    if not seen:
+        raise LookupError(
+            f"The Google Ads sheet has no row for {day} — check that the script ran and the sheet is "
+            "published with 'automatically republish' on."
+        )
+    return total
 
 
 def _refunded_amount(order: dict) -> float:
@@ -1160,6 +1188,7 @@ def calculate_profit(
         key = _order_key(o.get("order_number") or o.get("name"))
         cj  = cj_orders.get(key) or cj_orders.get(_order_key(o.get("id")))
         cj_cancelled = bool(cj) and str(cj.get("orderStatus", "")).upper() == "CANCELLED"
+        cj_unpriced = bool(cj) and not cj_cancelled and not _cj_row_cost(cj)
         rows.append({
             "order": o.get("name"),
             "gross_incl_vat": gross,
@@ -1174,6 +1203,8 @@ def calculate_profit(
             "cj_total_reported": None if not cj else _to_float(cj.get("orderAmount")) * usd_rate,
             "cj_status": cj.get("orderStatus") if cj else None,
             "cj_cancelled": cj_cancelled,
+            "cj_unpriced": cj_unpriced,
+            "cj_amount_fields": _cj_amount_fields(cj) if cj else None,
         })
 
     # Prefer orderAmount when product/postage split is missing.
@@ -1185,12 +1216,12 @@ def calculate_profit(
 
     # Estimate CJ cost for orders not (yet) in CJ, using the cost ratio of matched orders
     # (based on revenue before refunds, since CJ charges for the full order).
-    matched = [r for r in rows if r["cj_found"] and not r["cj_cancelled"]]
+    matched = [r for r in rows if r["cj_found"] and not r["cj_cancelled"] and not r["cj_unpriced"]]
     match_rev = sum(r["revenue_before_refunds_ex_vat"] for r in matched)
     cost_ratio = (sum(r["cj_cost"] for r in matched) / match_rev) if match_rev else None
     for r in rows:
         r["cj_estimated_cost"] = 0.0
-        if not r["cj_found"] and cost_ratio is not None:
+        if (not r["cj_found"] or r["cj_unpriced"]) and cost_ratio is not None:
             r["cj_estimated_cost"] = r["revenue_before_refunds_ex_vat"] * cost_ratio
             r["cj_cost"] = r["cj_estimated_cost"]
             r["cj_estimated"] = True
@@ -1211,7 +1242,7 @@ def calculate_profit(
     def ratio(a: float, b: float) -> Optional[float]:
         return round(a / b, 2) if b else None
 
-    missing = [r["order"] for r in rows if not r["cj_found"]]
+    missing = [r["order"] for r in rows if not r["cj_found"] or r["cj_unpriced"]]
     return {
         "orders": len(rows),
         "revenue_incl_vat": gross,
@@ -1236,7 +1267,10 @@ def calculate_profit(
         "cost_per_order": ratio(ad_spend, len(rows)),
         "cj_orders_matched": len(rows) - len(missing),
         "cj_orders_estimated": [r["order"] for r in rows if r["cj_estimated"]],
-        "cj_orders_missing_no_estimate": [r["order"] for r in rows if not r["cj_found"] and not r["cj_estimated"]],
+        "cj_orders_unpriced": [r["order"] for r in rows if r["cj_unpriced"]],
+        "cj_orders_missing_no_estimate": [
+            r["order"] for r in rows if (not r["cj_found"] or r["cj_unpriced"]) and not r["cj_estimated"]
+        ],
         "order_details": [
             {k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()} for r in rows
         ],
@@ -1310,12 +1344,11 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
 
         ad_spend = params.ad_spend
         if ad_spend is None:
-            ad_spend = await _google_ads_spend(day)
-            if ad_spend is None:
+            try:
+                ad_spend = await _google_ads_spend(day)
+            except LookupError as e:
                 ad_spend = 0.0
-                warnings.append(
-                    "No Google Ads spend found for this day — pass ad_spend or set GOOGLE_ADS_SPEND_CSV_URL."
-                )
+                warnings.append(f"No Google Ads spend: {e}")
         fixed = DAILY_FIXED_COSTS if params.fixed_costs is None else params.fixed_costs
 
         report = calculate_profit(
@@ -1323,12 +1356,13 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
         )
         if report["cj_orders_estimated"]:
             warnings.append(
-                f"{len(report['cj_orders_estimated'])} order(s) not found in CJ yet — CJ cost estimated "
+                f"{len(report['cj_orders_estimated'])} order(s) not found or not yet priced in CJ — CJ cost estimated "
                 "from the cost ratio of matched orders."
             )
         if report["cj_orders_missing_no_estimate"]:
             warnings.append(
-                f"{len(report['cj_orders_missing_no_estimate'])} order(s) have no CJ cost and could not be estimated."
+                f"{len(report['cj_orders_missing_no_estimate'])} order(s) have no CJ cost yet and could not be "
+                "estimated (no priced CJ orders that day) — profit is overstated."
             )
         if not params.include_orders:
             report.pop("order_details")
