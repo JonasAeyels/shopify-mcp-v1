@@ -230,6 +230,41 @@ When adding the integration in Claude.ai, paste your `BEARER_TOKEN` value into t
 | `shopify_get_shop` | Get store info (name, currency, plan, etc.) |
 | `shopify_list_webhooks` | List configured webhooks |
 | `shopify_create_webhook` | Create a new webhook |
+| `daily_profit_report` | Daily profit & ROAS: Shopify revenue + CJ costs + Google Ads spend |
+
+---
+
+## Daily profit & ROAS report
+
+`daily_profit_report` combines three sources for one day (default: yesterday, in your shop's timezone):
+
+| Source | What | How |
+|---|---|---|
+| Shopify | Revenue, VAT, refunds, cancelled/test orders excluded | Admin API (`read_orders`) |
+| CJ Dropshipping | Product + shipping cost you paid per order | CJ API 2.0, matched on order number (`CJ_API_KEY`) |
+| Google Ads | Spend per day | Google Ads Script → Google Sheet → CSV (`GOOGLE_ADS_SPEND_CSV_URL`), or pass `ad_spend` |
+
+**Calculation**
+
+- Net revenue = (order total − refunds) excl. VAT
+- Profit before ads = net revenue − CJ cost − payment fees
+- Net profit = profit before ads − ad spend − fixed costs
+- ROAS = revenue incl. VAT (after refunds) ÷ ad spend (same basis as Google Ads)
+- Break-even ROAS = revenue incl. VAT ÷ profit before ads — above this ROAS you make money
+- POAS = profit before ads ÷ ad spend
+
+CJ amounts are in USD and converted with the daily ECB rate (or `USD_TO_SHOP_RATE`).
+Orders not yet in CJ get an **estimated** cost based on the cost ratio of that day's matched
+orders; they are listed in `cj_orders_estimated`, so yesterday's report is more accurate than today's.
+
+**Google Ads spend setup**
+
+1. Create an empty Google Sheet.
+2. Google Ads → Tools → Bulk actions → Scripts → `+`, paste `google-ads-spend-script.js`, set `SPREADSHEET_URL`.
+3. Authorize, run once, then schedule it **daily**.
+4. In the Sheet: File → Share → Publish to web → tab `spend` → CSV. Put that link in `GOOGLE_ADS_SPEND_CSV_URL`.
+
+Example prompts: *"Wat was mijn winst en ROAS gisteren?"* · *"Geef het winstrapport van 2026-09-28 per order."*
 
 ---
 
@@ -245,6 +280,13 @@ When adding the integration in Claude.ai, paste your `BEARER_TOKEN` value into t
 | `PORT` | No | `8000` | Port the server listens on |
 | `MCP_TRANSPORT` | No | `streamable-http` | Transport protocol |
 | `BEARER_TOKEN` | No | — | Protects your MCP endpoint (set in both Railway and Claude) |
+| `CJ_API_KEY` | No | — | CJ Dropshipping API key for product/shipping costs |
+| `GOOGLE_ADS_SPEND_CSV_URL` | No | — | Published CSV of the Google Ads spend sheet |
+| `PAYMENT_FEE_PERCENT` | No | `1.9` | Payment fee % per order |
+| `PAYMENT_FEE_FIXED` | No | `0.25` | Fixed payment fee per order |
+| `DAILY_FIXED_COSTS` | No | `0` | Fixed costs allocated per day |
+| `USD_TO_SHOP_RATE` | No | ECB daily rate | Fixed USD → shop currency rate for CJ costs |
+| `CJ_MAX_PAGES` | No | `20` | Max pages of recent CJ orders scanned per report |
 
 *Either `SHOPIFY_ACCESS_TOKEN` **or** `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET` is required.
 
