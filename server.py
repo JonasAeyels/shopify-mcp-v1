@@ -990,6 +990,7 @@ PAYMENT_FEE_FIXED       = float(os.environ.get("PAYMENT_FEE_FIXED", "0.25"))
 DAILY_FIXED_COSTS       = float(os.environ.get("DAILY_FIXED_COSTS", "0"))
 USD_TO_SHOP_RATE        = os.environ.get("USD_TO_SHOP_RATE", "")       # optional fixed rate, e.g. 0.92
 GOOGLE_ADS_SPEND_CSV_URL = os.environ.get("GOOGLE_ADS_SPEND_CSV_URL", "")
+ESTIMATED_COGS_PERCENT  = os.environ.get("ESTIMATED_COGS_PERCENT", "")  # fallback when CJ has no price yet
 
 
 class CJClient:
@@ -1140,16 +1141,20 @@ async def _google_ads_spend(day: str) -> Optional[float]:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(GOOGLE_ADS_SPEND_CSV_URL, timeout=30.0)
     resp.raise_for_status()
+    lines = resp.text.splitlines()
     total, seen = 0.0, False
-    for line in resp.text.splitlines()[1:]:
+    for line in lines[1:]:
         cells = next(csv.reader([line]), [])
         if len(cells) >= 2 and cells[0].strip()[:10] == day:
             total += _to_float(cells[1].strip().replace(",", "."))
             seen = True
     if not seen:
+        header = lines[0][:60] if lines else "(empty)"
+        last = lines[-1][:60] if len(lines) > 1 else "(no data rows)"
         raise LookupError(
-            f"The Google Ads sheet has no row for {day} — check that the script ran and the sheet is "
-            "published with 'automatically republish' on."
+            f"The Google Ads sheet has no row for {day}. The published CSV has {max(len(lines) - 1, 0)} "
+            f"data row(s); header: '{header}', last row: '{last}'. Check that the 'spend' tab is the one "
+            "published as CSV and that 'automatically republish' is on."
         )
     return total
 
@@ -1171,6 +1176,7 @@ def calculate_profit(
     fixed_costs: float,
     fee_percent: float,
     fee_fixed: float,
+    fallback_cogs_percent: Optional[float] = None,
 ) -> dict:
     """Pure calculation: combine Shopify orders, CJ costs and ad spend into daily metrics."""
     rows: List[dict] = []
@@ -1219,6 +1225,10 @@ def calculate_profit(
     matched = [r for r in rows if r["cj_found"] and not r["cj_cancelled"] and not r["cj_unpriced"]]
     match_rev = sum(r["revenue_before_refunds_ex_vat"] for r in matched)
     cost_ratio = (sum(r["cj_cost"] for r in matched) / match_rev) if match_rev else None
+    estimate_basis = "priced CJ orders of this day" if cost_ratio is not None else None
+    if cost_ratio is None and fallback_cogs_percent is not None:
+        cost_ratio = fallback_cogs_percent / 100
+        estimate_basis = f"ESTIMATED_COGS_PERCENT ({fallback_cogs_percent:g}% of revenue)"
     for r in rows:
         r["cj_estimated_cost"] = 0.0
         if (not r["cj_found"] or r["cj_unpriced"]) and cost_ratio is not None:
@@ -1267,6 +1277,7 @@ def calculate_profit(
         "cost_per_order": ratio(ad_spend, len(rows)),
         "cj_orders_matched": len(rows) - len(missing),
         "cj_orders_estimated": [r["order"] for r in rows if r["cj_estimated"]],
+        "cj_estimate_basis": estimate_basis if any(r["cj_estimated"] for r in rows) else None,
         "cj_orders_unpriced": [r["order"] for r in rows if r["cj_unpriced"]],
         "cj_orders_missing_no_estimate": [
             r["order"] for r in rows if (not r["cj_found"] or r["cj_unpriced"]) and not r["cj_estimated"]
@@ -1352,17 +1363,19 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
         fixed = DAILY_FIXED_COSTS if params.fixed_costs is None else params.fixed_costs
 
         report = calculate_profit(
-            orders, cj_orders, usd_rate, ad_spend, fixed, PAYMENT_FEE_PERCENT, PAYMENT_FEE_FIXED
+            orders, cj_orders, usd_rate, ad_spend, fixed, PAYMENT_FEE_PERCENT, PAYMENT_FEE_FIXED,
+            float(ESTIMATED_COGS_PERCENT) if ESTIMATED_COGS_PERCENT else None,
         )
         if report["cj_orders_estimated"]:
             warnings.append(
-                f"{len(report['cj_orders_estimated'])} order(s) not found or not yet priced in CJ — CJ cost estimated "
-                "from the cost ratio of matched orders."
+                f"{len(report['cj_orders_estimated'])} order(s) not found or not yet priced in CJ — CJ cost "
+                f"estimated from {report['cj_estimate_basis']}."
             )
         if report["cj_orders_missing_no_estimate"]:
             warnings.append(
                 f"{len(report['cj_orders_missing_no_estimate'])} order(s) have no CJ cost yet and could not be "
-                "estimated (no priced CJ orders that day) — profit is overstated."
+                "estimated (no priced CJ orders that day; set ESTIMATED_COGS_PERCENT for a fallback) — "
+                "profit is overstated."
             )
         if not params.include_orders:
             report.pop("order_details")
