@@ -286,6 +286,7 @@ Example prompts: *"Wat was mijn winst en ROAS gisteren?"* · *"Geef het winstrap
 | `PAYMENT_FEE_FIXED` | No | `0.25` | Fixed payment fee per order |
 | `DAILY_FIXED_COSTS` | No | `0` | Fixed costs allocated per day |
 | `USD_TO_SHOP_RATE` | No | ECB daily rate | Fixed USD → shop currency rate for CJ costs |
+| `ESTIMATED_COGS_PERCENT` | No | — | Fallback CJ cost as % of revenue for orders CJ has not priced yet |
 | `CJ_MAX_PAGES` | No | `20` | Max pages of recent CJ orders scanned per report |
 
 *Either `SHOPIFY_ACCESS_TOKEN` **or** `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET` is required.
