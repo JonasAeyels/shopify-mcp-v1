@@ -989,6 +989,7 @@ PAYMENT_FEE_PERCENT     = float(os.environ.get("PAYMENT_FEE_PERCENT", "1.9"))
 PAYMENT_FEE_FIXED       = float(os.environ.get("PAYMENT_FEE_FIXED", "0.25"))
 DAILY_FIXED_COSTS       = float(os.environ.get("DAILY_FIXED_COSTS", "0"))
 USD_TO_SHOP_RATE        = os.environ.get("USD_TO_SHOP_RATE", "")       # optional fixed rate, e.g. 0.92
+GOOGLE_ADS_CURRENCY     = os.environ.get("GOOGLE_ADS_CURRENCY", "").strip().upper()  # e.g. EUR; blank = shop currency
 GOOGLE_ADS_SPEND_CSV_URL = os.environ.get("GOOGLE_ADS_SPEND_CSV_URL", "")
 ESTIMATED_COGS_PERCENT  = os.environ.get("ESTIMATED_COGS_PERCENT", "")  # fallback when CJ has no price yet
 
@@ -1119,19 +1120,24 @@ def _cj_amount_fields(row: dict) -> dict:
     return {k: v for k, v in row.items() if any(w in k.lower() for w in words) and not isinstance(v, (dict, list))}
 
 
-async def _usd_rate(currency: str, day: str) -> float:
-    if currency == "USD":
+async def _fx_rate(source: str, target: str, day: str) -> float:
+    """Daily ECB rate to convert `source` into `target` currency."""
+    if source == target:
         return 1.0
-    if USD_TO_SHOP_RATE:
-        return float(USD_TO_SHOP_RATE)
     async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(
             f"https://api.frankfurter.dev/v1/{day}",
-            params={"from": "USD", "to": currency},
+            params={"from": source, "to": target},
             timeout=15.0,
         )
     resp.raise_for_status()
-    return float(resp.json()["rates"][currency])
+    return float(resp.json()["rates"][target])
+
+
+async def _usd_rate(currency: str, day: str) -> float:
+    if currency != "USD" and USD_TO_SHOP_RATE:
+        return float(USD_TO_SHOP_RATE)
+    return await _fx_rate("USD", currency, day)
 
 
 async def _google_ads_spend(day: str) -> Optional[float]:
@@ -1354,11 +1360,19 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
                 warnings.append("CJ_API_KEY not set — CJ costs are 0, profit is overstated.")
 
         ad_spend = params.ad_spend
+        ad_info: Dict[str, Any] = {"ad_spend_source": "parameter (shop currency)"}
         if ad_spend is None:
             try:
                 ad_spend = await _google_ads_spend(day)
+                ads_currency = GOOGLE_ADS_CURRENCY or currency
+                ad_info = {"ad_spend_source": "Google Ads sheet", "ad_spend_original": f"{ad_spend:.2f} {ads_currency}"}
+                if ads_currency != currency:
+                    rate = await _fx_rate(ads_currency, currency, day)
+                    ad_info["ads_to_shop_rate"] = round(rate, 4)
+                    ad_spend = ad_spend * rate
             except LookupError as e:
                 ad_spend = 0.0
+                ad_info = {"ad_spend_source": None}
                 warnings.append(f"No Google Ads spend: {e}")
         fixed = DAILY_FIXED_COSTS if params.fixed_costs is None else params.fixed_costs
 
@@ -1384,6 +1398,7 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
             "date": day,
             "currency": currency,
             "usd_to_shop_rate": round(usd_rate, 4),
+            **ad_info,
             **report,
             "warnings": warnings,
         })
