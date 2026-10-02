@@ -982,12 +982,18 @@ async def shopify_add_product_image(params: AddProductImageInput) -> str:
 # DAILY PROFIT & ROAS (Shopify + CJ Dropshipping + Google Ads)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _num(value: str) -> Optional[float]:
+    """Parse a number from an env var, tolerating '25%', '1,9' and '€ 3'."""
+    cleaned = "".join(ch for ch in str(value or "") if ch.isdigit() or ch in ".,-").replace(",", ".")
+    return float(cleaned) if cleaned not in ("", ".", "-") else None
+
+
 CJ_API_KEY              = os.environ.get("CJ_API_KEY", "")
 CJ_BASE_URL             = "https://developers.cjdropshipping.com/api2.0/v1"
 CJ_MAX_PAGES            = int(os.environ.get("CJ_MAX_PAGES", "20"))
-PAYMENT_FEE_PERCENT     = float(os.environ.get("PAYMENT_FEE_PERCENT", "1.9"))
-PAYMENT_FEE_FIXED       = float(os.environ.get("PAYMENT_FEE_FIXED", "0.25"))
-DAILY_FIXED_COSTS       = float(os.environ.get("DAILY_FIXED_COSTS", "0"))
+PAYMENT_FEE_PERCENT     = _num(os.environ.get("PAYMENT_FEE_PERCENT", "1.9")) or 0.0
+PAYMENT_FEE_FIXED       = _num(os.environ.get("PAYMENT_FEE_FIXED", "0.25")) or 0.0
+DAILY_FIXED_COSTS       = _num(os.environ.get("DAILY_FIXED_COSTS", "0")) or 0.0
 USD_TO_SHOP_RATE        = os.environ.get("USD_TO_SHOP_RATE", "")       # optional fixed rate, e.g. 0.92
 GOOGLE_ADS_CURRENCY     = os.environ.get("GOOGLE_ADS_CURRENCY", "").strip().upper()  # e.g. EUR; blank = shop currency
 GOOGLE_ADS_SPEND_CSV_URL = os.environ.get("GOOGLE_ADS_SPEND_CSV_URL", "")
@@ -1136,7 +1142,7 @@ async def _fx_rate(source: str, target: str, day: str) -> float:
 
 async def _usd_rate(currency: str, day: str) -> float:
     if currency != "USD" and USD_TO_SHOP_RATE:
-        return float(USD_TO_SHOP_RATE)
+        return _num(USD_TO_SHOP_RATE) or 1.0
     return await _fx_rate("USD", currency, day)
 
 
@@ -1378,7 +1384,7 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
 
         report = calculate_profit(
             orders, cj_orders, usd_rate, ad_spend, fixed, PAYMENT_FEE_PERCENT, PAYMENT_FEE_FIXED,
-            float(ESTIMATED_COGS_PERCENT) if ESTIMATED_COGS_PERCENT else None,
+            _num(ESTIMATED_COGS_PERCENT),
         )
         if report["cj_orders_estimated"]:
             warnings.append(
