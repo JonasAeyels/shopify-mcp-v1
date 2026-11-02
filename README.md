@@ -248,7 +248,7 @@ When adding the integration in Claude.ai, paste your `BEARER_TOKEN` value into t
 
 - Net revenue = (order total − refunds) excl. VAT
 - Profit before ads = net revenue − CJ cost − payment fees
-- Net profit = profit before ads − ad spend − fixed costs
+- Net profit = profit before ads − ad spend − media buyer fee − fixed costs
 - ROAS = revenue incl. VAT (after refunds) ÷ ad spend (same basis as Google Ads)
 - Break-even ROAS = revenue incl. VAT ÷ profit before ads — above this ROAS you make money
 - POAS = profit before ads ÷ ad spend
@@ -284,6 +284,7 @@ Example prompts: *"Wat was mijn winst en ROAS gisteren?"* · *"Geef het winstrap
 | `GOOGLE_ADS_SPEND_CSV_URL` | No | — | Published CSV of the Google Ads spend sheet |
 | `PAYMENT_FEE_PERCENT` | No | `1.9` | Payment fee % per order |
 | `PAYMENT_FEE_FIXED` | No | `0.25` | Fixed payment fee per order |
+| `MEDIA_BUYER_FEE_PERCENT` | No | `0` | Media buyer fee as % of ad spend, deducted from profit |
 | `DAILY_FIXED_COSTS` | No | `0` | Fixed costs allocated per day |
 | `USD_TO_SHOP_RATE` | No | ECB daily rate | Fixed USD → shop currency rate for CJ costs |
 | `GOOGLE_ADS_CURRENCY` | No | shop currency | Google Ads account currency (e.g. `EUR`), converted to shop currency |

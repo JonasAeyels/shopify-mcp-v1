@@ -998,6 +998,7 @@ USD_TO_SHOP_RATE        = os.environ.get("USD_TO_SHOP_RATE", "")       # optiona
 GOOGLE_ADS_CURRENCY     = os.environ.get("GOOGLE_ADS_CURRENCY", "").strip().upper()  # e.g. EUR; blank = shop currency
 GOOGLE_ADS_SPEND_CSV_URL = os.environ.get("GOOGLE_ADS_SPEND_CSV_URL", "")
 ESTIMATED_COGS_PERCENT  = os.environ.get("ESTIMATED_COGS_PERCENT", "")  # fallback when CJ has no price yet
+MEDIA_BUYER_FEE_PERCENT = _num(os.environ.get("MEDIA_BUYER_FEE_PERCENT", "0")) or 0.0  # fee on top of ad spend
 
 
 class CJClient:
@@ -1189,6 +1190,7 @@ def calculate_profit(
     fee_percent: float,
     fee_fixed: float,
     fallback_cogs_percent: Optional[float] = None,
+    media_buyer_fee_percent: float = 0.0,
 ) -> dict:
     """Pure calculation: combine Shopify orders, CJ costs and ad spend into daily metrics."""
     rows: List[dict] = []
@@ -1258,7 +1260,9 @@ def calculate_profit(
     cogs         = total("cj_cost")
     fees         = total("payment_fee")
     before_ads   = round(net_revenue - cogs - fees, 2)
-    net_profit   = round(before_ads - ad_spend - fixed_costs, 2)
+    buyer_fee    = round(ad_spend * media_buyer_fee_percent / 100, 2)
+    marketing    = ad_spend + buyer_fee
+    net_profit   = round(before_ads - marketing - fixed_costs, 2)
     revenue_after_refunds = round(gross - refunded, 2)
 
     def ratio(a: float, b: float) -> Optional[float]:
@@ -1278,15 +1282,21 @@ def calculate_profit(
         "payment_fees": fees,
         "profit_before_ads": before_ads,
         "ad_spend": round(ad_spend, 2),
+        "media_buyer_fee": buyer_fee,
+        "media_buyer_fee_percent": media_buyer_fee_percent,
+        "marketing_cost_total": round(marketing, 2),
         "fixed_costs": round(fixed_costs, 2),
         "net_profit": net_profit,
         "net_margin_pct": round(net_profit / net_revenue * 100, 1) if net_revenue else None,
         "aov_incl_vat": ratio(gross, len(rows)),
         # ROAS on revenue incl. VAT (what Google Ads reports as conversion value).
         "roas": ratio(revenue_after_refunds, ad_spend),
-        "break_even_roas": ratio(revenue_after_refunds, before_ads) if before_ads > 0 else None,
-        "poas": ratio(before_ads, ad_spend),
+        # Break-even includes the media buyer fee: profit is 0 when ad spend × (1 + fee) = before_ads.
+        "break_even_roas": ratio(revenue_after_refunds * (1 + media_buyer_fee_percent / 100), before_ads)
+        if before_ads > 0 else None,
+        "poas": ratio(before_ads, marketing),
         "cost_per_order": ratio(ad_spend, len(rows)),
+        "cost_per_order_incl_fee": ratio(marketing, len(rows)),
         "cj_orders_matched": len(rows) - len(missing),
         "cj_orders_estimated": [r["order"] for r in rows if r["cj_estimated"]],
         "cj_estimate_basis": estimate_basis if any(r["cj_estimated"] for r in rows) else None,
@@ -1385,6 +1395,7 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
         report = calculate_profit(
             orders, cj_orders, usd_rate, ad_spend, fixed, PAYMENT_FEE_PERCENT, PAYMENT_FEE_FIXED,
             _num(ESTIMATED_COGS_PERCENT),
+            MEDIA_BUYER_FEE_PERCENT,
         )
         if report["cj_orders_estimated"]:
             warnings.append(
