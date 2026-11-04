@@ -1153,18 +1153,42 @@ def _cj_amount_fields(row: dict) -> dict:
     return {k: v for k, v in row.items() if any(w in k.lower() for w in words) and not isinstance(v, (dict, list))}
 
 
+# Last rate seen per currency pair, and rough rates for when the rate service is down.
+_FX_CACHE: Dict[tuple, float] = {}
+_FX_DEFAULTS = {("USD", "GBP"): 0.75, ("EUR", "GBP"): 0.84, ("USD", "EUR"): 0.86, ("GBP", "EUR"): 1.19,
+                ("EUR", "USD"): 1.16, ("GBP", "USD"): 1.33}
+_fx_warnings: List[str] = []
+
+
 async def _fx_rate(source: str, target: str, day: str) -> float:
-    """Daily ECB rate to convert `source` into `target` currency."""
+    """Daily ECB rate to convert `source` into `target` currency.
+    Falls back to the last known (or a rough default) rate if the rate service does not answer."""
     if source == target:
         return 1.0
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        resp = await client.get(
-            f"https://api.frankfurter.dev/v1/{day}",
-            params={"from": source, "to": target},
-            timeout=15.0,
-        )
-    resp.raise_for_status()
-    return float(resp.json()["rates"][target])
+    key = (source, target)
+    if (key, day) in _FX_CACHE:
+        return _FX_CACHE[(key, day)]
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(
+                f"https://api.frankfurter.dev/v1/{day}",
+                params={"from": source, "to": target},
+                timeout=10.0,
+            )
+        resp.raise_for_status()
+        rate = float(resp.json()["rates"][target])
+    except Exception as e:
+        rate = _FX_CACHE.get(key) or _FX_DEFAULTS.get(key)
+        if rate is None:
+            raise
+        logger.warning(f"FX rate {source}->{target} for {day} unavailable ({e}); using {rate}")
+        note = f"Exchange-rate service unavailable — used approximate {source}→{target} rate {rate:g}."
+        if note not in _fx_warnings:
+            _fx_warnings.append(note)
+        return rate
+    _FX_CACHE[key] = rate
+    _FX_CACHE[(key, day)] = rate
+    return rate
 
 
 async def _usd_rate(currency: str, day: str) -> float:
@@ -1406,6 +1430,7 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
         }, "orders")
 
         warnings: List[str] = []
+        _fx_warnings.clear()
         cj_orders: Dict[str, dict] = {}
         usd_rate = 1.0
         if orders:
@@ -1459,7 +1484,7 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
             "usd_to_shop_rate": round(usd_rate, 4),
             **ad_info,
             **report,
-            "warnings": warnings,
+            "warnings": warnings + _fx_warnings,
         })
     except Exception as e:
         return _error(e)
@@ -1514,6 +1539,7 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
         }, "orders")
 
         warnings: List[str] = []
+        _fx_warnings.clear()
         cj_orders: Dict[str, dict] = {}
         usd_rate = 1.0
         if orders:
@@ -1600,7 +1626,7 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
             "ads_to_shop_rate": round(ads_rate, 4),
             "media_buyer_fee_percent": MEDIA_BUYER_FEE_PERCENT,
             "totals": totals,
-            "warnings": warnings,
+            "warnings": warnings + _fx_warnings,
         }
         if params.include_days:
             out["days"] = days
