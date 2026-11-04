@@ -231,6 +231,7 @@ When adding the integration in Claude.ai, paste your `BEARER_TOKEN` value into t
 | `shopify_list_webhooks` | List configured webhooks |
 | `shopify_create_webhook` | Create a new webhook |
 | `daily_profit_report` | Daily profit & ROAS: Shopify revenue + CJ costs + Google Ads spend |
+| `profit_report_range` | Same report over a period (max 62 days), with totals, CJ product/shipping split and per-day rows |
 
 ---
 
