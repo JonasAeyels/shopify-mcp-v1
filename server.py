@@ -244,7 +244,10 @@ def _error(e: Exception) -> str:
         }
         return messages.get(status, f"Shopify API error {status}: {json.dumps(detail)}")
     if isinstance(e, httpx.TimeoutException):
-        return "Request timed out — try again."
+        try:
+            return f"Request to {e.request.url.host} timed out — try again."
+        except RuntimeError:
+            return "Request timed out — try again."
     if isinstance(e, RuntimeError):
         return str(e)
     return f"Unexpected error: {type(e).__name__}: {e}"
@@ -991,6 +994,7 @@ def _num(value: str) -> Optional[float]:
 CJ_API_KEY              = os.environ.get("CJ_API_KEY", "")
 CJ_BASE_URL             = "https://developers.cjdropshipping.com/api2.0/v1"
 CJ_MAX_PAGES            = int(os.environ.get("CJ_MAX_PAGES", "20"))
+CJ_MIN_INTERVAL         = 0.3  # seconds between CJ requests (CJ limit: 4 per second)
 PAYMENT_FEE_PERCENT     = _num(os.environ.get("PAYMENT_FEE_PERCENT", "1.9")) or 0.0
 PAYMENT_FEE_FIXED       = _num(os.environ.get("PAYMENT_FEE_FIXED", "0.25")) or 0.0
 DAILY_FIXED_COSTS       = _num(os.environ.get("DAILY_FIXED_COSTS", "0")) or 0.0
@@ -1009,6 +1013,16 @@ class CJClient:
         self._token: str = ""
         self._expires_at: float = 0.0
         self._lock = asyncio.Lock()
+        self._rate_lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def _throttle(self) -> None:
+        # CJ allows 4 requests per second per account; stay under it across concurrent tool calls.
+        async with self._rate_lock:
+            wait = self._next_at - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._next_at = time.time() + CJ_MIN_INTERVAL
 
     async def _get_token(self) -> str:
         if self._token and time.time() < self._expires_at:
@@ -1035,13 +1049,25 @@ class CJClient:
 
     async def get(self, path: str, params: Optional[dict] = None) -> Any:
         token = await self._get_token()
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(
-                f"{CJ_BASE_URL}/{path}",
-                headers={"CJ-Access-Token": token},
-                params=params,
-                timeout=30.0,
-            )
+        for attempt in range(4):
+            await self._throttle()
+            try:
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    resp = await client.get(
+                        f"{CJ_BASE_URL}/{path}",
+                        headers={"CJ-Access-Token": token},
+                        params=params,
+                        timeout=45.0,
+                    )
+            except httpx.TimeoutException:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            if resp.status_code == 429 and attempt < 3:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            break
         resp.raise_for_status()
         data = resp.json()
         if not data.get("result"):
@@ -1083,10 +1109,10 @@ async def _shopify_get_all(path: str, params: dict, key: str) -> List[dict]:
     return results
 
 
-async def _cj_costs_for(order_keys: set, oldest_date: str) -> Dict[str, dict]:
+async def _cj_costs_for(order_keys: set, oldest_date: str, max_pages: int = CJ_MAX_PAGES) -> Dict[str, dict]:
     """Page through recent CJ orders until all wanted orders are found or we pass oldest_date."""
     found: Dict[str, dict] = {}
-    for page in range(1, CJ_MAX_PAGES + 1):
+    for page in range(1, max_pages + 1):
         data = await cj_client.get("shopping/order/list", {"pageNum": page, "pageSize": 50})
         rows = (data or {}).get("list") or []
         if not rows:
@@ -1170,6 +1196,22 @@ async def _google_ads_spend(day: str) -> Optional[float]:
             "published as CSV and that 'automatically republish' is on."
         )
     return total
+
+
+async def _google_ads_spend_by_day() -> Dict[str, float]:
+    """All rows of the published Google Ads sheet as {date: cost}."""
+    if not GOOGLE_ADS_SPEND_CSV_URL:
+        raise LookupError("GOOGLE_ADS_SPEND_CSV_URL is not set.")
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get(GOOGLE_ADS_SPEND_CSV_URL, timeout=30.0)
+    resp.raise_for_status()
+    spend: Dict[str, float] = {}
+    for line in resp.text.splitlines()[1:]:
+        cells = next(csv.reader([line]), [])
+        if len(cells) >= 2 and cells[0].strip():
+            day = cells[0].strip()[:10]
+            spend[day] = spend.get(day, 0.0) + _to_float(cells[1].strip().replace(",", "."))
+    return spend
 
 
 def _refunded_amount(order: dict) -> float:
@@ -1419,6 +1461,150 @@ async def daily_profit_report(params: DailyProfitInput) -> str:
             **report,
             "warnings": warnings,
         })
+    except Exception as e:
+        return _error(e)
+
+
+class ProfitRangeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    start_date: str = Field(..., description="First day, YYYY-MM-DD (shop timezone)")
+    end_date: str = Field(..., description="Last day, YYYY-MM-DD (shop timezone), inclusive. Max 62 days.")
+    include_days: bool = Field(default=True, description="Include a per-day breakdown")
+
+    @field_validator("start_date", "end_date")
+    @classmethod
+    def _check_date(cls, v: str) -> str:
+        from datetime import date as _date
+        _date.fromisoformat(v)
+        return v
+
+
+@mcp.tool(
+    name="profit_report_range",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def profit_report_range(params: ProfitRangeInput) -> str:
+    """Profit & ROAS over a period (e.g. a month): totals and per-day rows with revenue,
+    CJ product and shipping cost, payment fees, Google Ads spend, media buyer fee and net profit.
+    Fetches Shopify and CJ orders once for the whole period."""
+    from datetime import date, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    try:
+        d0, d1 = date.fromisoformat(params.start_date), date.fromisoformat(params.end_date)
+        if d1 < d0:
+            return "end_date must be on or after start_date."
+        if (d1 - d0).days > 61:
+            return "Period too long — use at most 62 days."
+
+        shop     = (await _request("GET", "shop.json")).get("shop", {})
+        tz       = ZoneInfo(shop.get("iana_timezone") or "Europe/Brussels")
+        currency = shop.get("currency") or "EUR"
+        today    = datetime.now(tz).date()
+        rate_day = min(d1, today).isoformat()
+
+        start = datetime.combine(d0, datetime.min.time(), tzinfo=tz)
+        end   = datetime.combine(d1 + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+        orders = await _shopify_get_all("orders.json", {
+            "status": "any",
+            "limit": 250,
+            "created_at_min": start.isoformat(),
+            "created_at_max": (end - timedelta(seconds=1)).isoformat(),
+            "fields": "id,name,order_number,created_at,total_price,total_tax,cancelled_at,test,refunds,currency",
+        }, "orders")
+
+        warnings: List[str] = []
+        cj_orders: Dict[str, dict] = {}
+        usd_rate = 1.0
+        if orders:
+            if CJ_API_KEY:
+                keys = {_order_key(o.get("order_number") or o.get("name")) for o in orders}
+                oldest = (start - timedelta(days=3)).date().isoformat()
+                cj_orders = await _cj_costs_for(keys, oldest, max_pages=CJ_MAX_PAGES * 3)
+                usd_rate = await _usd_rate(currency, rate_day)
+            else:
+                warnings.append("CJ_API_KEY not set — CJ costs are 0, profit is overstated.")
+
+        try:
+            spend_by_day = await _google_ads_spend_by_day()
+        except LookupError as e:
+            spend_by_day = {}
+            warnings.append(f"No Google Ads spend: {e}")
+        ads_currency = GOOGLE_ADS_CURRENCY or currency
+        ads_rate = await _fx_rate(ads_currency, currency, rate_day) if spend_by_day and ads_currency != currency else 1.0
+
+        by_day: Dict[str, List[dict]] = {}
+        for o in orders:
+            local_day = datetime.fromisoformat(o["created_at"]).astimezone(tz).date().isoformat()
+            by_day.setdefault(local_day, []).append(o)
+
+        day_keys = ["orders", "revenue_incl_vat", "refunds", "net_revenue_ex_vat", "cj_product_cost",
+                    "cj_shipping_cost", "cj_estimated_cost", "cj_cost_total", "payment_fees",
+                    "profit_before_ads", "ad_spend", "media_buyer_fee", "fixed_costs", "net_profit"]
+        days, missing_spend, estimated = [], [], []
+        d = d0
+        while d <= d1:
+            key = d.isoformat()
+            spend = spend_by_day.get(key)
+            # The sheet holds the last 30 days and skips days without spend: only days before its
+            # first row are unknown; a missing day inside its window means no spend.
+            if spend is None and spend_by_day and key < min(spend_by_day):
+                missing_spend.append(key)
+            r = calculate_profit(
+                by_day.get(key, []), cj_orders, usd_rate, (spend or 0.0) * ads_rate, DAILY_FIXED_COSTS,
+                PAYMENT_FEE_PERCENT, PAYMENT_FEE_FIXED, _num(ESTIMATED_COGS_PERCENT), MEDIA_BUYER_FEE_PERCENT,
+            )
+            estimated += r["cj_orders_estimated"] + r["cj_orders_missing_no_estimate"]
+            row = {"date": key, **{k: r[k] for k in day_keys}, "roas": r["roas"]}
+            if spend is not None:
+                row["ad_spend_original"] = round(spend, 2)
+            days.append(row)
+            d += timedelta(days=1)
+
+        t = {k: round(sum(row[k] for row in days), 2) for k in day_keys}
+        after_refunds = t["revenue_incl_vat"] - t["refunds"]
+        net_rev, n = t["net_revenue_ex_vat"], t["orders"]
+
+        def pct(a: float) -> Optional[float]:
+            return round(a / net_rev * 100, 1) if net_rev else None
+
+        totals = {
+            **t,
+            "ad_spend_original": f"{sum(row.get('ad_spend_original', 0) for row in days):.2f} {ads_currency}",
+            "cj_product_pct": pct(t["cj_product_cost"]),
+            "cj_shipping_pct": pct(t["cj_shipping_cost"]),
+            "cogs_pct": pct(t["cj_cost_total"]),
+            "payment_fees_pct": pct(t["payment_fees"]),
+            "aov_incl_vat": round(t["revenue_incl_vat"] / n, 2) if n else None,
+            "cj_product_per_order": round(t["cj_product_cost"] / n, 2) if n else None,
+            "cj_shipping_per_order": round(t["cj_shipping_cost"] / n, 2) if n else None,
+            "roas": round(after_refunds / t["ad_spend"], 2) if t["ad_spend"] else None,
+            "break_even_roas": round(after_refunds * (1 + MEDIA_BUYER_FEE_PERCENT / 100) / t["profit_before_ads"], 2)
+            if t["profit_before_ads"] > 0 else None,
+            "cost_per_order": round(t["ad_spend"] / n, 2) if n else None,
+            "net_margin_pct": pct(t["net_profit"]),
+        }
+        if estimated:
+            warnings.append(f"{len(estimated)} order(s) had no CJ price yet; their cost is estimated: {', '.join(estimated)}.")
+        if missing_spend:
+            warnings.append(
+                f"No Google Ads spend known for {len(missing_spend)} day(s) ({missing_spend[0]} … "
+                f"{missing_spend[-1]}): the sheet only keeps the last 30 days, so ROAS and profit for the "
+                "period exclude that spend. Raise BACKFILL_DAYS in the Google Ads script to keep more history."
+            )
+        out: Dict[str, Any] = {
+            "start_date": params.start_date,
+            "end_date": params.end_date,
+            "currency": currency,
+            "usd_to_shop_rate": round(usd_rate, 4),
+            "ads_to_shop_rate": round(ads_rate, 4),
+            "media_buyer_fee_percent": MEDIA_BUYER_FEE_PERCENT,
+            "totals": totals,
+            "warnings": warnings,
+        }
+        if params.include_days:
+            out["days"] = days
+        return _fmt(out)
     except Exception as e:
         return _error(e)
 
