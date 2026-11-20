@@ -9,6 +9,7 @@ Token Management:
   - Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (recommended for OAuth apps)
   - Falls back to static SHOPIFY_ACCESS_TOKEN if client credentials not set
 """
+import collections
 import csv
 import json
 import os
@@ -1269,6 +1270,54 @@ async def _google_ads_spend_by_day() -> Dict[str, float]:
     return spend
 
 
+def _product_breakdown(orders: List[dict], order_details: List[dict]) -> List[dict]:
+    """Per product: units, revenue (after discounts), CJ cost and payment fees allocated by line revenue."""
+    details = {d["order"]: d for d in order_details}
+    products: Dict[Any, dict] = {}
+    for o in orders:
+        d = details.get(o.get("name"))
+        if not d or o.get("cancelled_at") or o.get("test"):
+            continue
+        lines = []
+        for li in o.get("line_items") or []:
+            qty = int(li.get("quantity") or 0)
+            disc = sum(_to_float(a.get("amount")) for a in li.get("discount_allocations") or [])
+            lines.append((li, qty, max(_to_float(li.get("price")) * qty - disc, 0.0)))
+        total = sum(rev for _, _, rev in lines)
+        for li, qty, rev in lines:
+            share = rev / total if total else (1 / len(lines))
+            p = products.setdefault(li.get("product_id") or li.get("title"), {
+                "product": li.get("title"), "units": 0, "orders": 0, "revenue": 0.0, "cj_cost": 0.0,
+                "payment_fees": 0.0, "estimated_units": 0, "prices": collections.Counter(),
+            })
+            p["units"] += qty
+            p["orders"] += 1
+            p["revenue"] += rev
+            p["cj_cost"] += (d.get("cj_cost") or 0.0) * share
+            p["payment_fees"] += (d.get("payment_fee") or 0.0) * share
+            p["prices"][li.get("price")] += qty
+            if d.get("cj_estimated"):
+                p["estimated_units"] += qty
+    total_rev = sum(p["revenue"] for p in products.values()) or 1.0
+    out = []
+    for p in sorted(products.values(), key=lambda x: -x["revenue"]):
+        u = p["units"] or 1
+        out.append({
+            "product": p["product"],
+            "units": p["units"],
+            "orders": p["orders"],
+            "list_price": p["prices"].most_common(1)[0][0] if p["prices"] else None,
+            "avg_price_paid": round(p["revenue"] / u, 2),
+            "revenue": round(p["revenue"], 2),
+            "revenue_share_pct": round(p["revenue"] / total_rev * 100, 1),
+            "cj_cost_per_unit": round(p["cj_cost"] / u, 2),
+            "cogs_pct": round(p["cj_cost"] / p["revenue"] * 100, 1) if p["revenue"] else None,
+            "profit_per_unit_before_ads": round((p["revenue"] - p["cj_cost"] - p["payment_fees"]) / u, 2),
+            "estimated_units": p["estimated_units"],
+        })
+    return out
+
+
 def _refunded_amount(order: dict) -> float:
     total = 0.0
     for refund in order.get("refunds") or []:
@@ -1528,6 +1577,10 @@ class ProfitRangeInput(BaseModel):
     start_date: str = Field(..., description="First day, YYYY-MM-DD (shop timezone)")
     end_date: str = Field(..., description="Last day, YYYY-MM-DD (shop timezone), inclusive. Max 62 days.")
     include_days: bool = Field(default=True, description="Include a per-day breakdown")
+    include_products: bool = Field(
+        default=False,
+        description="Include a per-product breakdown: units, price, CJ cost per unit, COGS % and profit per unit",
+    )
 
     @field_validator("start_date", "end_date")
     @classmethod
@@ -1568,7 +1621,8 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
             "limit": 250,
             "created_at_min": start.isoformat(),
             "created_at_max": (end - timedelta(seconds=1)).isoformat(),
-            "fields": "id,name,order_number,created_at,total_price,total_tax,cancelled_at,test,refunds,currency",
+            "fields": "id,name,order_number,created_at,total_price,total_tax,cancelled_at,test,refunds,currency"
+                      + (",line_items" if params.include_products else ""),
         }, "orders")
 
         warnings: List[str] = []
@@ -1663,6 +1717,8 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
             "totals": totals,
             "warnings": warnings + _fx_warnings,
         }
+        if params.include_products:
+            out["products"] = _product_breakdown(orders, all_orders)
         if params.include_days:
             out["days"] = days
         return _fmt(out)
