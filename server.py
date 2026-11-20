@@ -1147,9 +1147,40 @@ def _cj_row_cost(row: dict) -> float:
     )
 
 
+def _cj_shipping_line(row: Optional[dict]) -> Optional[str]:
+    """Name of the shipping line CJ used for an order (e.g. "CJPacket Ordinary", "YunExpress")."""
+    if not row:
+        return None
+    for key in ("logisticName", "logisticsName", "logisticsMethod", "shippingMethod"):
+        if row.get(key):
+            return str(row[key]).strip()
+    return None
+
+
+def _shipping_by_line(order_rows: List[dict]) -> Dict[str, dict]:
+    """Group CJ-priced orders by shipping line: orders, total and average shipping/product cost."""
+    lines: Dict[str, dict] = {}
+    for r in order_rows:
+        if not r.get("cj_found") or r.get("cj_unpriced") or r.get("cj_cancelled"):
+            continue
+        g = lines.setdefault(r.get("cj_shipping_line") or "unknown", {"orders": 0, "shipping": 0.0, "product": 0.0})
+        g["orders"] += 1
+        g["shipping"] += r.get("cj_shipping") or 0.0
+        g["product"] += r.get("cj_product") or 0.0
+    return {
+        name: {
+            "orders": g["orders"],
+            "shipping_total": round(g["shipping"], 2),
+            "shipping_per_order": round(g["shipping"] / g["orders"], 2),
+            "product_per_order": round(g["product"] / g["orders"], 2),
+        }
+        for name, g in sorted(lines.items(), key=lambda kv: -kv[1]["orders"])
+    }
+
+
 def _cj_amount_fields(row: dict) -> dict:
     """Amount/status fields of a CJ order, for diagnosing cost matching."""
-    words = ("amount", "price", "postage", "cost", "fee", "status")
+    words = ("amount", "price", "postage", "cost", "fee", "status", "logistic")
     return {k: v for k, v in row.items() if any(w in k.lower() for w in words) and not isinstance(v, (dict, list))}
 
 
@@ -1288,6 +1319,7 @@ def calculate_profit(
             "cj_shipping": 0.0 if cj_cancelled or not cj else _to_float(cj.get("postageAmount")) * usd_rate,
             "cj_total_reported": None if not cj else _to_float(cj.get("orderAmount")) * usd_rate,
             "cj_status": cj.get("orderStatus") if cj else None,
+            "cj_shipping_line": _cj_shipping_line(cj),
             "cj_cancelled": cj_cancelled,
             "cj_unpriced": cj_unpriced,
             "cj_amount_fields": _cj_amount_fields(cj) if cj else None,
@@ -1370,6 +1402,7 @@ def calculate_profit(
         "cj_orders_missing_no_estimate": [
             r["order"] for r in rows if (not r["cj_found"] or r["cj_unpriced"]) and not r["cj_estimated"]
         ],
+        "shipping_by_line": _shipping_by_line(rows),
         "order_details": [
             {k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()} for r in rows
         ],
@@ -1567,7 +1600,7 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
         day_keys = ["orders", "revenue_incl_vat", "refunds", "net_revenue_ex_vat", "cj_product_cost",
                     "cj_shipping_cost", "cj_estimated_cost", "cj_cost_total", "payment_fees",
                     "profit_before_ads", "ad_spend", "media_buyer_fee", "fixed_costs", "net_profit"]
-        days, missing_spend, estimated = [], [], []
+        days, missing_spend, estimated, all_orders = [], [], [], []
         d = d0
         while d <= d1:
             key = d.isoformat()
@@ -1581,6 +1614,7 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
                 PAYMENT_FEE_PERCENT, PAYMENT_FEE_FIXED, _num(ESTIMATED_COGS_PERCENT), MEDIA_BUYER_FEE_PERCENT,
             )
             estimated += r["cj_orders_estimated"] + r["cj_orders_missing_no_estimate"]
+            all_orders += r["order_details"]
             row = {"date": key, **{k: r[k] for k in day_keys}, "roas": r["roas"]}
             if spend is not None:
                 row["ad_spend_original"] = round(spend, 2)
@@ -1601,6 +1635,7 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
             "cj_shipping_pct": pct(t["cj_shipping_cost"]),
             "cogs_pct": pct(t["cj_cost_total"]),
             "payment_fees_pct": pct(t["payment_fees"]),
+            "shipping_by_line": _shipping_by_line(all_orders),
             "aov_incl_vat": round(t["revenue_incl_vat"] / n, 2) if n else None,
             "cj_product_per_order": round(t["cj_product_cost"] / n, 2) if n else None,
             "cj_shipping_per_order": round(t["cj_shipping_cost"] / n, 2) if n else None,
