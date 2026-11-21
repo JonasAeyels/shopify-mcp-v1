@@ -1318,6 +1318,39 @@ def _product_breakdown(orders: List[dict], order_details: List[dict]) -> List[di
     return out
 
 
+async def _refunds_processed(start, end) -> Dict[str, float]:
+    """Refunds paid out between start and end (any order date), as Shopify's own reports count them."""
+    orders = await _shopify_get_all("orders.json", {
+        "status": "any",
+        "limit": 250,
+        "updated_at_min": start.isoformat(),
+        "fields": "id,created_at,refunds",
+    }, "orders")
+    total = older = 0.0
+    for o in orders:
+        for refund in o.get("refunds") or []:
+            for tx in refund.get("transactions") or []:
+                if tx.get("kind") != "refund" or tx.get("status") != "success":
+                    continue
+                when = datetime_fromiso(tx.get("processed_at") or tx.get("created_at") or refund.get("created_at"))
+                if when is None or not (start <= when < end):
+                    continue
+                amount = _to_float(tx.get("amount"))
+                total += amount
+                created = datetime_fromiso(o.get("created_at"))
+                if created is not None and created < start:
+                    older += amount
+    return {"total": round(total, 2), "on_older_orders": round(older, 2)}
+
+
+def datetime_fromiso(value: Any):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except ValueError:
+        return None
+
+
 def _refunded_amount(order: dict) -> float:
     total = 0.0
     for refund in order.get("refunds") or []:
@@ -1676,6 +1709,7 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
             d += timedelta(days=1)
 
         t = {k: round(sum(row[k] for row in days), 2) for k in day_keys}
+        refunds_paid = await _refunds_processed(start, end)
         after_refunds = t["revenue_incl_vat"] - t["refunds"]
         net_rev, n = t["net_revenue_ex_vat"], t["orders"]
 
@@ -1698,6 +1732,11 @@ async def profit_report_range(params: ProfitRangeInput) -> str:
             if t["profit_before_ads"] > 0 else None,
             "cost_per_order": round(t["ad_spend"] / n, 2) if n else None,
             "net_margin_pct": pct(t["net_profit"]),
+            # Cohort view above counts refunds on orders placed in the period; this counts refunds
+            # paid out in the period (incl. older orders), like Shopify's reports.
+            "refunds_paid_in_period": refunds_paid["total"],
+            "refunds_paid_on_older_orders": refunds_paid["on_older_orders"],
+            "net_profit_after_older_refunds": round(t["net_profit"] - refunds_paid["on_older_orders"], 2),
         }
         if estimated:
             warnings.append(f"{len(estimated)} order(s) had no CJ price yet; their cost is estimated: {', '.join(estimated)}.")
